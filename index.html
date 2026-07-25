@@ -126,10 +126,13 @@
   .btn:active{ transform:scale(.97); }
 
   .permission-box{
-    margin:16px; padding:16px; background:var(--panel); border:1px solid var(--velvet); border-radius:12px;
-    display:flex; flex-direction:column; gap:10px; align-items:flex-start;
+    position:fixed; left:14px; right:14px; bottom:calc(env(safe-area-inset-bottom) + 14px); z-index:30;
+    padding:14px 16px; background:var(--panel); border:1px solid var(--border); border-radius:14px;
+    box-shadow:0 8px 24px rgba(0,0,0,.35);
+    display:flex; align-items:center; gap:12px; justify-content:space-between;
   }
-  .permission-box p{ margin:0; font-size:14px; color:var(--ink-dim); }
+  .permission-box p{ margin:0; font-size:13.5px; color:var(--ink-dim); flex:1; }
+  .permission-box .btn{ padding:10px 18px; font-size:14px; white-space:nowrap; }
 
   /* Menu */
   .menu-overlay{ position:fixed; inset:0; background:rgba(0,0,0,.5); z-index:40; opacity:0; pointer-events:none; transition:opacity .18s; }
@@ -168,14 +171,6 @@
     white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
   }
 
-  .toast{
-    position:fixed; left:50%; bottom:26px; transform:translate(-50%,0);
-    background:#20242f; border:1px solid var(--border); color:var(--ink);
-    padding:11px 16px; border-radius:10px; font-size:13.5px; z-index:80;
-    opacity:0; pointer-events:none; transition:opacity .25s, transform .25s;
-  }
-  .toast.show{ opacity:1; transform:translate(-50%,-6px); }
-
   .hidden{ display:none !important; }
 </style>
 </head>
@@ -209,7 +204,7 @@
   </div>
 
   <div id="permissionState" class="permission-box hidden">
-    <p>A pasta <strong id="permFolderName">filmes</strong> já foi escolhida antes. Toque para liberar o acesso novamente.</p>
+    <p>Toque para continuar de onde parou</p>
     <button class="btn" id="grantPermBtn">Continuar</button>
   </div>
 
@@ -245,8 +240,6 @@
   <video id="video" playsinline controls></video>
 </div>
 
-<div class="toast" id="toast"></div>
-
 <script>
 (function(){
   "use strict";
@@ -278,24 +271,15 @@
   const el = (id) => document.getElementById(id);
   const emptyState = el("emptyState");
   const permissionState = el("permissionState");
-  const permFolderName = el("permFolderName");
   const library = el("library");
   const noResults = el("noResults");
   const searchWrap = el("searchWrap");
   const searchInput = el("searchInput");
   const unsupportedMsg = el("unsupportedMsg");
-  const toastEl = el("toast");
 
   let dirHandle = null;
   let allEntries = []; // {name, path, category, handle}
   let objectUrls = [];
-
-  function toast(msg){
-    toastEl.textContent = msg;
-    toastEl.classList.add("show");
-    clearTimeout(toast._t);
-    toast._t = setTimeout(() => toastEl.classList.remove("show"), 2400);
-  }
 
   function isVideoFile(name){
     const ext = name.split(".").pop().toLowerCase();
@@ -363,9 +347,6 @@
     await walk(dirHandle, "", allEntries);
     allEntries.sort((a,b) => a.name.localeCompare(b.name, "pt-BR"));
     render(allEntries);
-    if (allEntries.length === 0){
-      toast("Nenhum vídeo encontrado na pasta selecionada.");
-    }
   }
 
   // ---------- Thumbnails ----------
@@ -384,20 +365,17 @@
       v.defaultMuted = true;
       v.playsInline = true;
       v.src = url;
+      v.style.cssText = "position:fixed; width:2px; height:2px; opacity:0; pointer-events:none; left:-9999px;";
+      document.body.appendChild(v);
       let settled = false;
-      let dataReady = false;
-      let seekedOnce = false;
-      const timer = setTimeout(fail, 5000);
-      const cleanup = () => { clearTimeout(timer); URL.revokeObjectURL(url); };
+      const timer = setTimeout(fail, 6000);
+      function cleanup(){ clearTimeout(timer); URL.revokeObjectURL(url); v.removeAttribute("src"); v.load(); v.remove(); }
       function fail(){ if (settled) return; settled = true; cleanup(); resolve(null); }
       function finish(dataUrl){ if (settled) return; settled = true; cleanup(); resolve(dataUrl); }
 
       function capture(){
         if (settled) return;
-        if (!v.videoWidth || !v.videoHeight){
-          requestAnimationFrame(capture);
-          return;
-        }
+        if (!v.videoWidth || !v.videoHeight){ fail(); return; }
         try{
           const canvas = document.createElement("canvas");
           const w = 320;
@@ -410,17 +388,18 @@
         } catch(e){ fail(); }
       }
 
-      v.onloadedmetadata = () => {
-        if (!isFinite(v.duration) || v.duration <= 0){
-          try { v.currentTime = 0.1; } catch(e){}
-          return;
-        }
-        const seekTo = Math.min(Math.max(v.duration * 0.1, 0.5), Math.max(v.duration - 0.1, 0));
+      v.addEventListener("loadedmetadata", () => {
+        const d = v.duration;
+        const seekTo = (isFinite(d) && d > 0) ? Math.min(Math.max(d * 0.1, 0.5), Math.max(d - 0.1, 0)) : 0.1;
         try { v.currentTime = seekTo; } catch(e){ fail(); }
-      };
-      v.onseeked = () => { seekedOnce = true; if (dataReady) capture(); };
-      v.onloadeddata = () => { dataReady = true; if (seekedOnce || v.readyState >= 2) capture(); };
-      v.onerror = fail;
+      }, { once: true });
+
+      v.addEventListener("seeked", () => {
+        // dá dois frames de folga pro navegador realmente pintar o vídeo antes de capturar
+        requestAnimationFrame(() => requestAnimationFrame(capture));
+      }, { once: true });
+
+      v.addEventListener("error", fail, { once: true });
     });
   }
 
@@ -585,16 +564,17 @@
     library.classList.add("hidden");
     searchWrap.classList.add("hidden");
   }
-  function showPermissionPrompt(name){
+  // Barra discreta pedindo um toque -- não esconde a biblioteca/busca que já estavam na tela
+  function showPermissionPrompt(){
     emptyState.classList.add("hidden");
     permissionState.classList.remove("hidden");
-    permFolderName.textContent = name || "filmes";
-    library.classList.add("hidden");
-    searchWrap.classList.add("hidden");
+  }
+  function hidePermissionPrompt(){
+    permissionState.classList.add("hidden");
   }
   function showLibrary(){
     emptyState.classList.add("hidden");
-    permissionState.classList.add("hidden");
+    hidePermissionPrompt();
     searchWrap.classList.remove("hidden");
   }
 
@@ -606,7 +586,7 @@
       showLibrary();
       await scanLibrary();
     } catch(e){
-      if (e.name !== "AbortError") toast("Não foi possível acessar a pasta.");
+      /* seleção cancelada ou sem permissão -- sem aviso, só volta pra tela inicial */
     }
   }
 
@@ -617,7 +597,7 @@
       showLibrary();
       await scanLibrary();
     } else {
-      toast("Permissão negada.");
+      /* sem permissão -- mantém a tela de continuar visível */
     }
   });
   el("changeFolderBtn").addEventListener("click", async () => {
@@ -628,7 +608,7 @@
   });
   el("rescanBtn").addEventListener("click", async () => {
     closeMenu();
-    if (dirHandle){ toast("Atualizando..."); await scanLibrary(); toast("Biblioteca atualizada."); }
+    if (dirHandle){ await scanLibrary(); }
   });
 
   async function init(){
@@ -645,12 +625,26 @@
         showLibrary();
         await scanLibrary();
       } else {
-        showPermissionPrompt(dirHandle.name);
+        showPermissionPrompt();
       }
     } else {
       showEmpty();
     }
   }
+
+  // Quando o usuário volta pra essa aba (troca de app, minimizou, etc.), reconfere a
+  // permissão sem pedir gesto nenhum. Só mostra a barra de "continuar" se realmente
+  // precisar; do contrário o app permanece exatamente como estava, sem parecer que saiu.
+  document.addEventListener("visibilitychange", async () => {
+    if (document.visibilityState !== "visible" || !dirHandle) return;
+    const granted = await verifyPermission(dirHandle, false);
+    if (granted){
+      hidePermissionPrompt();
+      if (allEntries.length === 0) await scanLibrary();
+    } else {
+      showPermissionPrompt();
+    }
+  });
 
   // ---------- Menu ----------
   const menu = el("menu");
