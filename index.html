@@ -251,8 +251,29 @@
 (function(){
   "use strict";
 
-  const VIDEO_EXT = ["mp4","webm","ogv","ogg","mov","m4v","mkv","avi","3gp"];
+  const VIDEO_EXT = ["mp4","webm","ogv","ogg","mov","m4v","mkv","avi","3gp","wmv","flv","m2ts","ts"];
+  // Formatos que o Chrome normalmente NÃO decodifica -- pular geração de thumbnail (evita travar/esperar timeout)
+  const THUMB_UNSUPPORTED_EXT = ["mkv","avi","wmv","flv","m2ts","ts"];
   const supportsFS = "showDirectoryPicker" in window;
+
+  function extOf(name){ return name.split(".").pop().toLowerCase(); }
+
+  // Fila com limite de miniaturas geradas ao mesmo tempo (evita travar o celular
+  // quando várias fileiras aparecem juntas na tela)
+  const THUMB_CONCURRENCY = 2;
+  let thumbActive = 0;
+  const thumbQueue = [];
+  function scheduleThumb(task){
+    thumbQueue.push(task);
+    pumpThumbQueue();
+  }
+  function pumpThumbQueue(){
+    while (thumbActive < THUMB_CONCURRENCY && thumbQueue.length){
+      const task = thumbQueue.shift();
+      thumbActive++;
+      task().finally(() => { thumbActive--; pumpThumbQueue(); });
+    }
+  }
 
   const el = (id) => document.getElementById(id);
   const emptyState = el("emptyState");
@@ -358,49 +379,71 @@
     return new Promise((resolve) => {
       const url = URL.createObjectURL(file);
       const v = document.createElement("video");
-      v.preload = "metadata";
+      v.preload = "auto";
       v.muted = true;
+      v.defaultMuted = true;
       v.playsInline = true;
       v.src = url;
-      const cleanup = () => URL.revokeObjectURL(url);
-      const fail = () => { cleanup(); resolve(null); };
-      v.onloadedmetadata = () => {
-        const seekTo = Math.min(Math.max(v.duration * 0.1, 0.5), v.duration - 0.1 || 0.5);
-        try { v.currentTime = isFinite(seekTo) ? seekTo : 0; } catch(e){ fail(); }
-      };
-      v.onseeked = () => {
+      let settled = false;
+      let dataReady = false;
+      let seekedOnce = false;
+      const timer = setTimeout(fail, 5000);
+      const cleanup = () => { clearTimeout(timer); URL.revokeObjectURL(url); };
+      function fail(){ if (settled) return; settled = true; cleanup(); resolve(null); }
+      function finish(dataUrl){ if (settled) return; settled = true; cleanup(); resolve(dataUrl); }
+
+      function capture(){
+        if (settled) return;
+        if (!v.videoWidth || !v.videoHeight){
+          requestAnimationFrame(capture);
+          return;
+        }
         try{
           const canvas = document.createElement("canvas");
           const w = 320;
-          const h = Math.round(w * (v.videoHeight / v.videoWidth || 1.5));
+          const h = Math.round(w * (v.videoHeight / v.videoWidth));
           canvas.width = w; canvas.height = h;
           const ctx = canvas.getContext("2d");
           ctx.drawImage(v, 0, 0, w, h);
           const dataUrl = canvas.toDataURL("image/jpeg", 0.6);
-          cleanup();
-          resolve(dataUrl);
+          finish(dataUrl);
         } catch(e){ fail(); }
+      }
+
+      v.onloadedmetadata = () => {
+        if (!isFinite(v.duration) || v.duration <= 0){
+          try { v.currentTime = 0.1; } catch(e){}
+          return;
+        }
+        const seekTo = Math.min(Math.max(v.duration * 0.1, 0.5), Math.max(v.duration - 0.1, 0));
+        try { v.currentTime = seekTo; } catch(e){ fail(); }
       };
+      v.onseeked = () => { seekedOnce = true; if (dataReady) capture(); };
+      v.onloadeddata = () => { dataReady = true; if (seekedOnce || v.readyState >= 2) capture(); };
       v.onerror = fail;
-      setTimeout(fail, 8000);
     });
   }
 
   async function loadThumbnail(item, imgEl, spinnerEl){
+    const ext = extOf(item.name);
+    if (THUMB_UNSUPPORTED_EXT.includes(ext)){
+      spinnerEl.remove();
+      return;
+    }
     try {
       const key = await thumbKey(item);
-      let dataUrl = await idbGet("thumbs", key);
+      const cached = await idbGet("thumbs", key);
+      if (cached === "FAILED"){ spinnerEl.remove(); return; }
+      let dataUrl = cached;
       if (!dataUrl){
-        dataUrl = await generateThumbnail(item._file);
-        if (dataUrl) idbSet("thumbs", key, dataUrl);
+        dataUrl = await new Promise((resolve) => scheduleThumb(() => generateThumbnail(item._file).then(resolve)));
+        idbSet("thumbs", key, dataUrl || "FAILED");
       }
       if (dataUrl){
         imgEl.src = dataUrl;
         imgEl.classList.remove("hidden");
-        spinnerEl.remove();
-      } else {
-        spinnerEl.remove();
       }
+      spinnerEl.remove();
     } catch(e){
       spinnerEl.remove();
     }
